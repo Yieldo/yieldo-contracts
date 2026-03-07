@@ -1,0 +1,24 @@
+{
+  "name": "yieldo-contracts",
+  "version": "1.0.0",
+  "description": "Yieldo MVP Smart Contracts",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:avalanche": "hardhat run scripts/deploy.js --network avalanche",
+    "verify:avalanche": "hardhat run scripts/verify.js --network avalanche"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@openzeppelin/contracts": "^5.0.0",
+    "dotenv": "^16.3.1",
+    "hardhat": "^2.19.0",
+    "solc": "^0.8.33"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts-upgradeable": "^5.6.1",
+    "@openzeppelin/hardhat-upgrades": "^3.9.1",
+    "@pythnetwork/pyth-sdk-solidity": "^4.3.1",
+    "ethers": "^6.8.0"
+  }
+}
