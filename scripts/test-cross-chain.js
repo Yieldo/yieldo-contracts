@@ -1,7 +1,8 @@
 const { ethers } = require("ethers");
 const http = require("http");
 
-const pk = "REDACTED_PRIVATE_KEY";
+require("dotenv").config();
+const pk = process.env.PRIVATE_KEY;
 const API_BASE = "http://localhost:8000";
 
 const CHAINS = {

@@ -1,6 +1,7 @@
 const { ethers } = require("ethers");
+require("dotenv").config();
 
-const pk = "REDACTED_PRIVATE_KEY";
+const pk = process.env.PRIVATE_KEY;
 const provider = new ethers.JsonRpcProvider("https://api.avax.network/ext/bc/C/rpc");
 const wallet = new ethers.Wallet(pk, provider);
 
