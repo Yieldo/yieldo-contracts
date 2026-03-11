@@ -13,3 +13,6 @@ typechain-types/
 # Logs
 *.log
 .claude
+
+# Test scripts
+scripts/test-*
