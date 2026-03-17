@@ -21,6 +21,8 @@ contract DepositRouter is
 {
     using SafeERC20 for IERC20;
 
+    string public constant VERSION = "2.2.0";
+
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH =
         keccak256(
             "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline)"
@@ -284,11 +286,12 @@ contract DepositRouter is
         bytes32 intentHash,
         address asset,
         uint256 feeAmount,
+        address user,
         address referrer
     ) internal {
         if (feeAmount == 0) return;
 
-        if (referrer != address(0)) {
+        if (referrer != address(0) && referrer != user) {
             uint256 referralFee = feeAmount / 2;
             uint256 protocolFee = feeAmount - referralFee;
             IERC20(asset).safeTransfer(referrer, referralFee);
@@ -482,6 +485,12 @@ contract DepositRouter is
                 abi.encodeWithSignature("updatePriceFeeds(bytes[])", priceUpdate)
             );
             require(success, "Price update failed");
+
+            if (msg.value > updateFee) {
+                uint256 excess = msg.value - updateFee;
+                (bool refundSuccess, ) = msg.sender.call{value: excess}("");
+                require(refundSuccess, "ETH refund failed");
+            }
         }
     }
 
@@ -531,7 +540,7 @@ contract DepositRouter is
         uint256 feeAmount = (intent.amount * currentFeeBps) / 10000;
         uint256 depositAmount = intent.amount - feeAmount;
 
-        _collectFee(intentHash, intent.asset, feeAmount, referrer);
+        _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
 
         uint256 usdValue = _getUsdValue(intent.asset, depositAmount);
 
@@ -558,7 +567,7 @@ contract DepositRouter is
         uint256 feeAmount = (intent.amount * currentFeeBps) / 10000;
         uint256 depositAmount = intent.amount - feeAmount;
 
-        _collectFee(intentHash, intent.asset, feeAmount, referrer);
+        _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
 
         requestId = _executeVaultRequestCall(intent.vault, intent.asset, depositAmount, intent.user);
 
@@ -591,7 +600,7 @@ contract DepositRouter is
         uint256 feeAmount = (record.amount * currentFeeBps) / 10000;
         uint256 depositAmount = record.amount - feeAmount;
 
-        _collectFee(intentHash, record.asset, feeAmount, referrer);
+        _collectFee(intentHash, record.asset, feeAmount, record.user, referrer);
 
         uint256 usdValue = _getUsdValue(record.asset, depositAmount);
 
@@ -655,7 +664,7 @@ contract DepositRouter is
         uint256 feeAmount = (actualAmount * currentFeeBps) / 10000;
         uint256 depositAmount = actualAmount - feeAmount;
 
-        _collectFee(intentHash, intent.asset, feeAmount, referrer);
+        _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
 
         uint256 usdValue = _getUsdValue(intent.asset, depositAmount);
 
@@ -688,7 +697,7 @@ contract DepositRouter is
         uint256 feeAmount = (actualAmount * currentFeeBps) / 10000;
         uint256 depositAmount = actualAmount - feeAmount;
 
-        _collectFee(intentHash, intent.asset, feeAmount, referrer);
+        _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
 
         uint256 usdValue = _getUsdValue(intent.asset, depositAmount);
 
