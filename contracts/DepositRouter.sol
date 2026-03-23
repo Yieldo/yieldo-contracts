@@ -21,7 +21,7 @@ contract DepositRouter is
 {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.2.0";
+    string public constant VERSION = "2.3.0";
 
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH =
         keccak256(
@@ -64,8 +64,9 @@ contract DepositRouter is
     mapping(address => bool) public allowedVaults;
     bool public vaultWhitelistEnabled;
     address public pendingOwner;
+    mapping(address => address) public vedaTellers;
 
-    uint256[45] private __gap;
+    uint256[44] private __gap;
 
     // ─── Events ──────────────────────────────────────────────────────────────
 
@@ -132,6 +133,7 @@ contract DepositRouter is
     event VaultWhitelistToggled(bool enabled);
     event VaultAllowlistUpdated(address indexed vault, bool allowed);
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
+    event VedaTellerUpdated(address indexed vault, address indexed teller);
 
     // ─── Modifiers ───────────────────────────────────────────────────────────
 
@@ -245,6 +247,14 @@ contract DepositRouter is
             allowedVaults[vaults[i]] = allowed[i];
             emit VaultAllowlistUpdated(vaults[i], allowed[i]);
         }
+    }
+
+    // ─── Admin: Veda Teller mapping ─────────────────────────────────────────
+
+    /// @notice Set a Veda Teller address for a BoringVault. Pass address(0) to remove.
+    function setVedaTeller(address vault, address teller) external onlyOwner {
+        vedaTellers[vault] = teller;
+        emit VedaTellerUpdated(vault, teller);
     }
 
     // ─── Admin: pause / rescue ───────────────────────────────────────────────
@@ -366,31 +376,59 @@ contract DepositRouter is
         address recipient,
         bool isERC4626
     ) internal {
-        IERC20(asset).forceApprove(vault, depositAmount);
+        address teller = vedaTellers[vault];
 
-        bool success;
-        bytes memory returnData;
+        if (teller != address(0)) {
+            // Veda BoringVault: approve vault (not teller), call teller.deposit
+            IERC20(asset).forceApprove(vault, depositAmount);
 
-        if (isERC4626) {
-            (success, returnData) = vault.call(
-                abi.encodeWithSignature("deposit(uint256,address)", depositAmount, recipient)
-            );
-        } else {
-            (success, returnData) = vault.call(
+            (bool success, bytes memory returnData) = teller.call(
                 abi.encodeWithSignature(
-                    "syncDeposit(uint256,address,address)",
+                    "deposit(address,uint256,uint256)",
+                    asset,
                     depositAmount,
-                    recipient,
-                    address(0)
+                    0
                 )
             );
-        }
 
-        if (!success) {
-            _revertWithReason(returnData, isERC4626 ? "ERC4626 deposit failed" : "Vault deposit failed");
-        }
+            if (!success) {
+                _revertWithReason(returnData, "Veda deposit failed");
+            }
 
-        IERC20(asset).forceApprove(vault, 0);
+            // Shares are minted to this contract — transfer to recipient
+            uint256 shares = abi.decode(returnData, (uint256));
+            if (shares > 0) {
+                IERC20(vault).safeTransfer(recipient, shares);
+            }
+
+            IERC20(asset).forceApprove(vault, 0);
+        } else {
+            IERC20(asset).forceApprove(vault, depositAmount);
+
+            bool success;
+            bytes memory returnData;
+
+            if (isERC4626) {
+                (success, returnData) = vault.call(
+                    abi.encodeWithSignature("deposit(uint256,address)", depositAmount, recipient)
+                );
+            } else {
+                (success, returnData) = vault.call(
+                    abi.encodeWithSignature(
+                        "syncDeposit(uint256,address,address)",
+                        depositAmount,
+                        recipient,
+                        address(0)
+                    )
+                );
+            }
+
+            if (!success) {
+                _revertWithReason(returnData, isERC4626 ? "ERC4626 deposit failed" : "Vault deposit failed");
+            }
+
+            IERC20(asset).forceApprove(vault, 0);
+        }
     }
 
     function _executeVaultRequestCall(
