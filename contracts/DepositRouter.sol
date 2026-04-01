@@ -21,11 +21,11 @@ contract DepositRouter is
 {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.3.0";
+    string public constant VERSION = "2.4.0";
 
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH =
         keccak256(
-            "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline)"
+            "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline,uint256 feeBps)"
         );
 
     struct DepositIntent {
@@ -35,6 +35,7 @@ contract DepositRouter is
         uint256 amount;
         uint256 nonce;
         uint256 deadline;
+        uint256 feeBps;
     }
 
     struct DepositRecord {
@@ -46,6 +47,7 @@ contract DepositRouter is
         uint256 timestamp;
         bool executed;
         bool cancelled;
+        uint256 feeBps;      // 0 for pre-V2.4 records (uses global feeBps fallback)
     }
 
     // ─── Storage layout (V1 slots 0–8 — DO NOT reorder) ─────────────────────
@@ -65,8 +67,9 @@ contract DepositRouter is
     bool public vaultWhitelistEnabled;
     address public pendingOwner;
     mapping(address => address) public vedaTellers;
+    address public signer;                                                     // backend signer for intent verification
 
-    uint256[44] private __gap;
+    uint256[43] private __gap;
 
     // ─── Events ──────────────────────────────────────────────────────────────
 
@@ -134,6 +137,7 @@ contract DepositRouter is
     event VaultAllowlistUpdated(address indexed vault, bool allowed);
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
     event VedaTellerUpdated(address indexed vault, address indexed teller);
+    event SignerUpdated(address indexed newSigner);
 
     // ─── Modifiers ───────────────────────────────────────────────────────────
 
@@ -179,6 +183,11 @@ contract DepositRouter is
 
         oracle = IPriceOracle(_oracle);
         feeBps = _feeBps;
+    }
+
+    function reinitializeV3(address _signer) external reinitializer(3) {
+        require(_signer != address(0), "Invalid signer");
+        signer = _signer;
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
@@ -257,6 +266,14 @@ contract DepositRouter is
         emit VedaTellerUpdated(vault, teller);
     }
 
+    // ─── Admin: backend signer ─────────────────────────────────────────────
+
+    function setSigner(address _signer) external onlyOwner {
+        require(_signer != address(0), "Invalid signer");
+        signer = _signer;
+        emit SignerUpdated(_signer);
+    }
+
     // ─── Admin: pause / rescue ───────────────────────────────────────────────
 
     function pause() external onlyOwner {
@@ -282,8 +299,12 @@ contract DepositRouter is
 
     // ─── Internal helpers ────────────────────────────────────────────────────
 
-    function _getFeeBps() internal view returns (uint256) {
-        return feeBps > 0 ? feeBps : 10;
+    /// @dev For deferred execution: pre-V2.4 records have feeBps == 0; fall back to global feeBps.
+    /// New V2.4+ records store the actual per-txn feeBps (which CAN be 0 for fee-free txns).
+    /// To distinguish: V2.4+ records always go through _createRecord which stores intent.feeBps,
+    /// while legacy records have the default zero value. Using global feeBps for legacy is safe.
+    function _getRecordFeeBps(uint256 recordFeeBps) internal view returns (uint256) {
+        return recordFeeBps > 0 ? recordFeeBps : feeBps;
     }
 
     function _getUsdValue(address asset, uint256 amount) internal view returns (uint256) {
@@ -319,6 +340,7 @@ contract DepositRouter is
         require(intent.vault != address(0), "Invalid vault address");
         require(intent.asset != address(0), "Invalid asset address");
         require(intent.amount > 0, "Amount must be greater than 0");
+        require(intent.feeBps <= 1000, "Fee too high");
         require(verifyIntent(intent, signature), "Invalid signature");
         require(block.timestamp <= intent.deadline, "Intent expired");
         require(intent.nonce == nonces[intent.user], "Invalid nonce");
@@ -333,7 +355,8 @@ contract DepositRouter is
                 intent.asset,
                 intent.amount,
                 intent.nonce,
-                intent.deadline
+                intent.deadline,
+                intent.feeBps
             )
         );
     }
@@ -355,7 +378,8 @@ contract DepositRouter is
             deadline: intent.deadline,
             timestamp: block.timestamp,
             executed: executed,
-            cancelled: false
+            cancelled: false,
+            feeBps: intent.feeBps
         });
 
         emit DepositIntentCreated(
@@ -574,8 +598,7 @@ contract DepositRouter is
 
         IERC20(intent.asset).safeTransferFrom(intent.user, address(this), intent.amount);
 
-        uint256 currentFeeBps = _getFeeBps();
-        uint256 feeAmount = (intent.amount * currentFeeBps) / 10000;
+        uint256 feeAmount = (intent.amount * intent.feeBps) / 10000;
         uint256 depositAmount = intent.amount - feeAmount;
 
         _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
@@ -601,8 +624,7 @@ contract DepositRouter is
 
         IERC20(intent.asset).safeTransferFrom(intent.user, address(this), intent.amount);
 
-        uint256 currentFeeBps = _getFeeBps();
-        uint256 feeAmount = (intent.amount * currentFeeBps) / 10000;
+        uint256 feeAmount = (intent.amount * intent.feeBps) / 10000;
         uint256 depositAmount = intent.amount - feeAmount;
 
         _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
@@ -634,7 +656,7 @@ contract DepositRouter is
 
         IERC20(record.asset).safeTransferFrom(record.user, address(this), record.amount);
 
-        uint256 currentFeeBps = _getFeeBps();
+        uint256 currentFeeBps = _getRecordFeeBps(record.feeBps);
         uint256 feeAmount = (record.amount * currentFeeBps) / 10000;
         uint256 depositAmount = record.amount - feeAmount;
 
@@ -698,8 +720,7 @@ contract DepositRouter is
 
         _validateSlippageAndMinDeposit(intent.asset, intent.amount, actualAmount);
 
-        uint256 currentFeeBps = _getFeeBps();
-        uint256 feeAmount = (actualAmount * currentFeeBps) / 10000;
+        uint256 feeAmount = (actualAmount * intent.feeBps) / 10000;
         uint256 depositAmount = actualAmount - feeAmount;
 
         _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
@@ -731,8 +752,7 @@ contract DepositRouter is
 
         _validateSlippageAndMinDeposit(intent.asset, intent.amount, actualAmount);
 
-        uint256 currentFeeBps = _getFeeBps();
-        uint256 feeAmount = (actualAmount * currentFeeBps) / 10000;
+        uint256 feeAmount = (actualAmount * intent.feeBps) / 10000;
         uint256 depositAmount = actualAmount - feeAmount;
 
         _collectFee(intentHash, intent.asset, feeAmount, intent.user, referrer);
@@ -760,13 +780,14 @@ contract DepositRouter is
                 intent.asset,
                 intent.amount,
                 intent.nonce,
-                intent.deadline
+                intent.deadline,
+                intent.feeBps
             )
         );
 
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = ECDSA.recover(hash, signature);
-        return signer == intent.user;
+        address recovered = ECDSA.recover(hash, signature);
+        return recovered == signer;
     }
 
     function getNonce(address user) external view returns (uint256) {
