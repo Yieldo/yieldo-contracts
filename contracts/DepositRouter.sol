@@ -21,7 +21,7 @@ contract DepositRouter is
 {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.4.0";
+    string public constant VERSION = "2.5.0";
 
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH =
         keccak256(
@@ -68,8 +68,9 @@ contract DepositRouter is
     address public pendingOwner;
     mapping(address => address) public vedaTellers;
     address public signer;                                                     // backend signer for intent verification
+    mapping(address => address) public midasVaults;                             // token address => Midas issuance vault
 
-    uint256[43] private __gap;
+    uint256[42] private __gap;
 
     // ─── Events ──────────────────────────────────────────────────────────────
 
@@ -138,6 +139,7 @@ contract DepositRouter is
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
     event VedaTellerUpdated(address indexed vault, address indexed teller);
     event SignerUpdated(address indexed newSigner);
+    event MidasVaultUpdated(address indexed token, address indexed issuanceVault);
 
     // ─── Modifiers ───────────────────────────────────────────────────────────
 
@@ -264,6 +266,22 @@ contract DepositRouter is
     function setVedaTeller(address vault, address teller) external onlyOwner {
         vedaTellers[vault] = teller;
         emit VedaTellerUpdated(vault, teller);
+    }
+
+    // ─── Admin: Midas vault mapping ───────────────────────────────────────
+
+    /// @notice Set a Midas issuance vault for a token. Pass address(0) to remove.
+    function setMidasVault(address token, address issuanceVault) external onlyOwner {
+        midasVaults[token] = issuanceVault;
+        emit MidasVaultUpdated(token, issuanceVault);
+    }
+
+    function setMidasVaultBatch(address[] calldata tokens, address[] calldata issuanceVaults) external onlyOwner {
+        require(tokens.length == issuanceVaults.length, "Length mismatch");
+        for (uint256 i = 0; i < tokens.length; i++) {
+            midasVaults[tokens[i]] = issuanceVaults[i];
+            emit MidasVaultUpdated(tokens[i], issuanceVaults[i]);
+        }
     }
 
     // ─── Admin: backend signer ─────────────────────────────────────────────
@@ -400,10 +418,44 @@ contract DepositRouter is
         address recipient,
         bool isERC4626
     ) internal {
-        address teller = vedaTellers[vault];
+        // Path 1: Midas — vault is the token, deposits go through a separate issuance vault
+        address midasIssuance = midasVaults[vault];
+        if (midasIssuance != address(0)) {
+            IERC20(asset).forceApprove(midasIssuance, depositAmount);
 
+            // Midas depositInstant expects amountToken in 18 decimals
+            // but the actual amount of payment tokens transferred is based on tokenIn decimals.
+            // The vault handles the conversion internally — we pass the raw amount.
+            uint256 balBefore = IERC20(vault).balanceOf(address(this));
+
+            (bool success, bytes memory returnData) = midasIssuance.call(
+                abi.encodeWithSignature(
+                    "depositInstant(address,uint256,uint256,bytes32)",
+                    asset,
+                    depositAmount,
+                    0,  // minReceiveAmount — no slippage for instant deposits
+                    bytes32(0)  // referrerId — default
+                )
+            );
+
+            if (!success) {
+                _revertWithReason(returnData, "Midas deposit failed");
+            }
+
+            // Transfer minted tokens to recipient
+            uint256 balAfter = IERC20(vault).balanceOf(address(this));
+            uint256 received = balAfter - balBefore;
+            if (received > 0) {
+                IERC20(vault).safeTransfer(recipient, received);
+            }
+
+            IERC20(asset).forceApprove(midasIssuance, 0);
+            return;
+        }
+
+        // Path 2: Veda BoringVault — deposits go through a teller contract
+        address teller = vedaTellers[vault];
         if (teller != address(0)) {
-            // Veda BoringVault: approve vault (not teller), call teller.deposit
             IERC20(asset).forceApprove(vault, depositAmount);
 
             (bool success, bytes memory returnData) = teller.call(
@@ -419,16 +471,19 @@ contract DepositRouter is
                 _revertWithReason(returnData, "Veda deposit failed");
             }
 
-            // Shares are minted to this contract — transfer to recipient
             uint256 shares = abi.decode(returnData, (uint256));
             if (shares > 0) {
                 IERC20(vault).safeTransfer(recipient, shares);
             }
 
             IERC20(asset).forceApprove(vault, 0);
-        } else {
-            IERC20(asset).forceApprove(vault, depositAmount);
+            return;
+        }
 
+        // Path 3: ERC-4626 or Custom (syncDeposit)
+        IERC20(asset).forceApprove(vault, depositAmount);
+
+        {
             bool success;
             bytes memory returnData;
 
@@ -450,9 +505,9 @@ contract DepositRouter is
             if (!success) {
                 _revertWithReason(returnData, isERC4626 ? "ERC4626 deposit failed" : "Vault deposit failed");
             }
-
-            IERC20(asset).forceApprove(vault, 0);
         }
+
+        IERC20(asset).forceApprove(vault, 0);
     }
 
     function _executeVaultRequestCall(
