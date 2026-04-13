@@ -14,5 +14,6 @@ typechain-types/
 *.log
 .claude
 
+
 # Test scripts
 scripts/test-*

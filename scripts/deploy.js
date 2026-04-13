@@ -48,7 +48,7 @@ async function main() {
 
   await proxy.waitForDeployment();
   const proxyAddress = await proxy.getAddress();
-  const implAddress = await proxy.getImplementation();
+  const implAddress = await hre.upgrades.erc1967.getImplementationAddress(proxyAddress);
 
   console.log("\nProxy deployed to:", proxyAddress);
   console.log("Implementation deployed to:", implAddress);
