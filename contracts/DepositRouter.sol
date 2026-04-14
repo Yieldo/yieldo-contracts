@@ -16,7 +16,7 @@ import "./interfaces/IPriceOracle.sol";
 contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.5.1";
+    string public constant VERSION = "2.5.2";
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH = keccak256(
         "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline,uint256 feeBps)"
     );
@@ -61,7 +61,8 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     mapping(address => address) public vedaTellers;
     address public signer;
     mapping(address => address) public midasVaults;
-    uint256[42] private __gap;
+    uint16 public referralSplitBps; // V2.5.2: admin-configurable referrer share of fee (0-10000)
+    uint256[41] private __gap;
 
     event DepositIntentCreated(bytes32 indexed intentHash, address indexed user, address indexed vault, address asset, uint256 amount, uint256 nonce, uint256 deadline);
     event DepositExecuted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount, uint256 usdValue);
@@ -82,6 +83,7 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
     event VedaTellerUpdated(address indexed vault, address indexed teller);
     event SignerUpdated(address indexed newSigner);
+    event ReferralSplitUpdated(uint16 newSplitBps);
     event MidasVaultUpdated(address indexed token, address indexed issuanceVault);
 
     modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
@@ -112,6 +114,10 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     function reinitializeV3(address _signer) external reinitializer(3) {
         require(_signer != address(0));
         signer = _signer;
+    }
+
+    function reinitializeV4() external reinitializer(4) {
+        referralSplitBps = 5000; // default 50/50
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
@@ -148,6 +154,7 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         for (uint256 i = 0; i < t.length; i++) { midasVaults[t[i]] = iv[i]; emit MidasVaultUpdated(t[i], iv[i]); }
     }
     function setSigner(address _s) external onlyOwner { require(_s != address(0)); signer = _s; emit SignerUpdated(_s); }
+    function setReferralSplit(uint16 _bps) external onlyOwner { require(_bps <= 10000); referralSplitBps = _bps; emit ReferralSplitUpdated(_bps); }
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
     function withdrawETH() external onlyOwner {
@@ -173,11 +180,15 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     function _collectFee(bytes32 ih, address asset, uint256 fee, address user, address referrer) internal {
         if (fee == 0) return;
         if (referrer != address(0) && referrer != user) {
-            uint256 rFee = fee / 2;
-            IERC20(asset).safeTransfer(referrer, rFee);
-            IERC20(asset).safeTransfer(FEE_COLLECTOR, fee - rFee);
-            referralEarnings[referrer][asset] += rFee;
-            emit ReferralFeeCollected(ih, referrer, asset, rFee);
+            uint256 split = referralSplitBps;
+            if (split == 0) split = 5000; // safety default for pre-V4 proxies; reinitializeV4 sets this to 5000
+            uint256 rFee = (fee * split) / 10000;
+            if (rFee > 0) {
+                IERC20(asset).safeTransfer(referrer, rFee);
+                referralEarnings[referrer][asset] += rFee;
+                emit ReferralFeeCollected(ih, referrer, asset, rFee);
+            }
+            if (fee - rFee > 0) IERC20(asset).safeTransfer(FEE_COLLECTOR, fee - rFee);
         } else {
             IERC20(asset).safeTransfer(FEE_COLLECTOR, fee);
         }
