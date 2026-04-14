@@ -8,6 +8,7 @@ import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 import "./interfaces/IPriceOracle.sol";
@@ -15,7 +16,7 @@ import "./interfaces/IPriceOracle.sol";
 contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.5.0";
+    string public constant VERSION = "2.5.1";
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH = keccak256(
         "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline,uint256 feeBps)"
     );
@@ -203,12 +204,15 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     }
 
     function _executeVaultCall(address vault, address asset, uint256 amt, address recipient, bool isERC4626) internal {
-        // Midas: deposits go through separate issuance vault
+        // Midas: deposits go through separate issuance vault.
+        // Midas depositInstant expects amountToken in base18, not token-native decimals.
         address midasIV = midasVaults[vault];
         if (midasIV != address(0)) {
             IERC20(asset).forceApprove(midasIV, amt);
             uint256 balBefore = IERC20(vault).balanceOf(address(this));
-            (bool ok, bytes memory rd) = midasIV.call(abi.encodeWithSignature("depositInstant(address,uint256,uint256,bytes32)", asset, amt, 0, bytes32(0)));
+            uint8 dec = IERC20Metadata(asset).decimals();
+            uint256 amt18 = dec < 18 ? amt * (10 ** (18 - dec)) : (dec > 18 ? amt / (10 ** (dec - 18)) : amt);
+            (bool ok, bytes memory rd) = midasIV.call(abi.encodeWithSignature("depositInstant(address,uint256,uint256,bytes32)", asset, amt18, 0, bytes32(0)));
             if (!ok) _revertWithReason(rd, "Midas deposit failed");
             uint256 received = IERC20(vault).balanceOf(address(this)) - balBefore;
             if (received > 0) IERC20(vault).safeTransfer(recipient, received);
