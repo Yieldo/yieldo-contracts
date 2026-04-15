@@ -11,19 +11,14 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
-import "@openzeppelin/contracts/proxy/Clones.sol";
 import "./interfaces/IPriceOracle.sol";
-import "./WithdrawalEscrow.sol";
 
 contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.6.0";
+    string public constant VERSION = "2.6.1";
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH = keccak256(
         "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline,uint256 feeBps)"
-    );
-    bytes32 private constant WITHDRAW_INTENT_TYPEHASH = keccak256(
-        "WithdrawIntent(address user,address vault,address asset,uint256 shares,uint256 minAmountOut,uint256 nonce,uint256 deadline)"
     );
 
     struct DepositIntent {
@@ -48,16 +43,7 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         uint256 feeBps;
     }
 
-    struct WithdrawIntent {
-        address user;
-        address vault;
-        address asset;
-        uint256 shares;
-        uint256 minAmountOut;
-        uint256 nonce;
-        uint256 deadline;
-    }
-
+    // Retained struct: referenced by the dormant storage slot below to preserve UUPS layout.
     struct WithdrawRequest {
         address user;
         address vault;
@@ -87,9 +73,10 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     address public signer;
     mapping(address => address) public midasVaults;
     uint16 public referralSplitBps; // V2.5.2: admin-configurable referrer share of fee (0-10000)
-    mapping(address => address) public midasRedemptionVaults; // V2.6: share vault => Midas RedemptionVault
-    mapping(bytes32 => WithdrawRequest) public withdrawRequests; // V2.6: async withdrawal records
-    address public withdrawEscrowImpl; // V2.6: WithdrawalEscrow implementation used as Clones template
+    // V2.6 storage (deprecated in V2.6.1 — withdrawals now go direct-to-protocol; slots preserved for UUPS compat)
+    mapping(address => address) private _deprecated_midasRedemptionVaults;
+    mapping(bytes32 => WithdrawRequest) private _deprecated_withdrawRequests;
+    address private _deprecated_withdrawEscrowImpl;
     uint256[38] private __gap;
 
     event DepositIntentCreated(bytes32 indexed intentHash, address indexed user, address indexed vault, address asset, uint256 amount, uint256 nonce, uint256 deadline);
@@ -113,11 +100,6 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     event SignerUpdated(address indexed newSigner);
     event ReferralSplitUpdated(uint16 newSplitBps);
     event MidasVaultUpdated(address indexed token, address indexed issuanceVault);
-    event MidasRedemptionVaultUpdated(address indexed token, address indexed redemptionVault);
-    event WithdrawExecuted(address indexed user, address indexed vault, address indexed asset, uint256 shares, uint256 assets);
-    event WithdrawRequestSubmitted(bytes32 indexed reqHash, address indexed user, address indexed vault, address asset, uint256 shares, uint256 protocolRequestId, address escrow);
-    event WithdrawClaimed(bytes32 indexed reqHash, address indexed user, uint256 assets);
-    event WithdrawEscrowImplUpdated(address indexed impl);
 
     modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
     modifier whenVaultAllowed(address vault) { if (vaultWhitelistEnabled) require(allowedVaults[vault], "Vault not whitelisted"); _; }
@@ -186,12 +168,6 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         require(t.length == iv.length);
         for (uint256 i = 0; i < t.length; i++) { midasVaults[t[i]] = iv[i]; emit MidasVaultUpdated(t[i], iv[i]); }
     }
-    function setMidasRedemptionVault(address token, address rv) external onlyOwner { midasRedemptionVaults[token] = rv; emit MidasRedemptionVaultUpdated(token, rv); }
-    function setMidasRedemptionVaultBatch(address[] calldata t, address[] calldata rv) external onlyOwner {
-        require(t.length == rv.length);
-        for (uint256 i = 0; i < t.length; i++) { midasRedemptionVaults[t[i]] = rv[i]; emit MidasRedemptionVaultUpdated(t[i], rv[i]); }
-    }
-    function setWithdrawEscrowImpl(address impl) external onlyOwner { require(impl != address(0)); withdrawEscrowImpl = impl; emit WithdrawEscrowImplUpdated(impl); }
     function setSigner(address _s) external onlyOwner { require(_s != address(0)); signer = _s; emit SignerUpdated(_s); }
     function setReferralSplit(uint16 _bps) external onlyOwner { require(_bps <= 10000); referralSplitBps = _bps; emit ReferralSplitUpdated(_bps); }
     function pause() external onlyOwner { _pause(); }
@@ -446,80 +422,7 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         emit CrossChainDepositExecuted(ih, i.user, i.vault, depAmt, msg.sender, _getUsdValue(i.asset, depAmt));
     }
 
-    // Withdrawals (V2.6)
-    function withdrawWithIntent(WithdrawIntent calldata i, bytes calldata sig) external nonReentrant whenNotPaused returns (uint256 out) {
-        _validateWithdrawIntent(i, sig);
-        nonces[i.user]++;
-        IERC20(i.vault).safeTransferFrom(i.user, address(this), i.shares);
-        uint256 before = IERC20(i.asset).balanceOf(address(this));
-        _executeWithdrawCall(i.vault, i.asset, i.shares, i.minAmountOut);
-        out = IERC20(i.asset).balanceOf(address(this)) - before;
-        require(out >= i.minAmountOut, "Slippage");
-        IERC20(i.asset).safeTransfer(i.user, out);
-        emit WithdrawExecuted(i.user, i.vault, i.asset, i.shares, out);
-    }
-
-    function withdrawRequestWithIntent(WithdrawIntent calldata i, bytes calldata sig) external nonReentrant whenNotPaused returns (bytes32 reqHash) {
-        _validateWithdrawIntent(i, sig);
-        address midasRV = midasRedemptionVaults[i.vault];
-        require(midasRV != address(0), "Async unsupported");
-        require(withdrawEscrowImpl != address(0), "Escrow impl unset");
-        nonces[i.user]++;
-
-        reqHash = keccak256(abi.encode(i.user, i.vault, i.asset, i.shares, i.nonce, i.deadline, block.chainid));
-        require(withdrawRequests[reqHash].user == address(0), "Duplicate");
-
-        address escrow = Clones.cloneDeterministic(withdrawEscrowImpl, reqHash);
-        WithdrawalEscrow(escrow).init(address(this));
-
-        IERC20(i.vault).safeTransferFrom(i.user, escrow, i.shares);
-        uint256 protoId = WithdrawalEscrow(escrow).submitMidasRequest(i.vault, midasRV, i.asset, i.shares);
-
-        withdrawRequests[reqHash] = WithdrawRequest(i.user, i.vault, i.asset, escrow, i.shares, protoId, false);
-        emit WithdrawRequestSubmitted(reqHash, i.user, i.vault, i.asset, i.shares, protoId, escrow);
-    }
-
-    function claimWithdrawRequest(bytes32 reqHash) external nonReentrant whenNotPaused returns (uint256 amt) {
-        WithdrawRequest storage r = withdrawRequests[reqHash];
-        require(r.user != address(0) && !r.claimed, "Not claimable");
-        amt = WithdrawalEscrow(r.escrow).sweep(r.asset, r.user);
-        require(amt > 0, "Not ready");
-        r.claimed = true;
-        emit WithdrawClaimed(reqHash, r.user, amt);
-    }
-
-    function _validateWithdrawIntent(WithdrawIntent calldata i, bytes calldata sig) internal view {
-        require(i.user != address(0) && i.vault != address(0) && i.asset != address(0));
-        require(i.shares > 0);
-        require(verifyWithdrawIntent(i, sig), "Invalid signature");
-        require(block.timestamp <= i.deadline, "Intent expired");
-        require(i.nonce == nonces[i.user], "Invalid nonce");
-    }
-
-    function _executeWithdrawCall(address vault, address asset, uint256 shares, uint256 minOut) internal {
-        address midasRV = midasRedemptionVaults[vault];
-        bool ok; bytes memory rd;
-        if (midasRV != address(0)) {
-            IERC20(vault).forceApprove(midasRV, shares);
-            (ok, rd) = midasRV.call(abi.encodeWithSignature("redeemInstant(address,uint256,uint256)", asset, shares, minOut));
-            IERC20(vault).forceApprove(midasRV, 0);
-            if (!ok) _revertWithReason(rd, "Midas redeemInstant failed");
-            return;
-        }
-        if (vedaTellers[vault] != address(0)) revert("Veda withdraw via protocol UI");
-        (ok, rd) = vault.call(abi.encodeWithSignature("redeem(uint256,address,address)", shares, address(this), address(this)));
-        if (!ok) _revertWithReason(rd, "Redeem failed");
-    }
-
-    function predictWithdrawEscrow(bytes32 reqHash) external view returns (address) {
-        return Clones.predictDeterministicAddress(withdrawEscrowImpl, reqHash, address(this));
-    }
-
     // View functions
-    function verifyWithdrawIntent(WithdrawIntent calldata i, bytes calldata sig) public view returns (bool) {
-        bytes32 h = _hashTypedDataV4(keccak256(abi.encode(WITHDRAW_INTENT_TYPEHASH, i.user, i.vault, i.asset, i.shares, i.minAmountOut, i.nonce, i.deadline)));
-        return ECDSA.recover(h, sig) == signer;
-    }
     function verifyIntent(DepositIntent calldata i, bytes calldata sig) public view returns (bool) {
         bytes32 h = _hashTypedDataV4(keccak256(abi.encode(DEPOSIT_INTENT_TYPEHASH, i.user, i.vault, i.asset, i.amount, i.nonce, i.deadline, i.feeBps)));
         return ECDSA.recover(h, sig) == signer;
