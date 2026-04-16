@@ -270,21 +270,25 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
             IERC20(asset).forceApprove(vault, 0);
             return;
         }
-        // Lido Earn: deposits go through SyncDepositQueue which mints share tokens to msg.sender
-        // when the on-chain price report is fresh (max 32h age). Router pulls the resulting
-        // share tokens out of its own balance and forwards them to the user.
+        // Lido Earn: deposits go through SyncDepositQueue, which mints share tokens
+        // to msg.sender when the on-chain price report is fresh. If the report is
+        // stale the queue silently queues the deposit asynchronously — we guard
+        // with a require on non-zero share delta so that stale-report paths revert
+        // and return the user's assets rather than stranding them in the queue.
         address lidoQueue = lidoDepositQueues[vault][asset];
         if (lidoQueue != address(0)) {
+            require(amt <= type(uint224).max, "Lido amt overflow");
             IERC20(asset).forceApprove(lidoQueue, amt);
             uint256 balBefore = IERC20(vault).balanceOf(address(this));
             bytes32[] memory emptyProof = new bytes32[](0);
             (bool ok, bytes memory rd) = lidoQueue.call(
-                abi.encodeWithSignature("deposit(uint224,address,bytes32[])", uint224(amt), recipient, emptyProof)
+                abi.encodeWithSignature("deposit(uint224,address,bytes32[])", uint224(amt), address(0), emptyProof)
             );
             IERC20(asset).forceApprove(lidoQueue, 0);
             if (!ok) _revertWithReason(rd, "Lido deposit failed");
             uint256 received = IERC20(vault).balanceOf(address(this)) - balBefore;
-            if (received > 0) IERC20(vault).safeTransfer(recipient, received);
+            require(received > 0, "Lido report stale, retry");
+            IERC20(vault).safeTransfer(recipient, received);
             return;
         }
         // ERC-4626 or Custom (syncDeposit)

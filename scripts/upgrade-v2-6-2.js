@@ -19,7 +19,8 @@ async function main() {
 
   const fees = await p.getFeeData();
   const baseFee = fees.gasPrice - (fees.maxPriorityFeePerGas || 0n);
-  const priorityGwei = net === "monad" ? "1" : "0.05";
+  // Mainnet: ultra-low priority (0.02 gwei). Base: 0.05 gwei. Monad: 1 gwei.
+  const priorityGwei = net === "monad" ? "1" : net === "mainnet" ? "0.02" : "0.05";
   const priority = ethers.parseUnits(priorityGwei, "gwei");
   const maxFee = (baseFee * 13n) / 10n + priority;
   const gas = net === "monad"
