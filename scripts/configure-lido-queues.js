@@ -8,8 +8,11 @@ const hre = require("hardhat");
 
 const ROUTER = "0x85f76c1685046Ea226E1148EE1ab81a8a15C385d";
 
-const EARN_USD = "0x014e6DA8F283C4aF65B2AA0f201438680A004452";
-const EARN_ETH = "0x6a37725ca7f4CE81c004c955f7280d5C704a249e";
+// Share token addresses (ERC-20). These are what users hold and what the router
+// uses for balance-delta. The Vault contracts at 0x014e6da8... (USD strategy) and
+// 0x6a37725c... (ETH strategy) are NOT ERC-20 — the share tokens below are.
+const EARN_USD = "0x4Ce1ac8F43E0E5BD7A346A98aF777bF8fbeA1981";
+const EARN_ETH = "0xBBFC8683C8fE8cF73777feDE7ab9574935fea0A4";
 
 const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
