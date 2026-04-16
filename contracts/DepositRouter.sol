@@ -16,7 +16,7 @@ import "./interfaces/IPriceOracle.sol";
 contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.6.1";
+    string public constant VERSION = "2.6.2";
     bytes32 private constant DEPOSIT_INTENT_TYPEHASH = keccak256(
         "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline,uint256 feeBps)"
     );
@@ -77,7 +77,9 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     mapping(address => address) private _deprecated_midasRedemptionVaults;
     mapping(bytes32 => WithdrawRequest) private _deprecated_withdrawRequests;
     address private _deprecated_withdrawEscrowImpl;
-    uint256[38] private __gap;
+    // V2.6.2: Lido Earn — shareVault => asset => SyncDepositQueue.
+    mapping(address => mapping(address => address)) public lidoDepositQueues;
+    uint256[37] private __gap;
 
     event DepositIntentCreated(bytes32 indexed intentHash, address indexed user, address indexed vault, address asset, uint256 amount, uint256 nonce, uint256 deadline);
     event DepositExecuted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount, uint256 usdValue);
@@ -100,6 +102,7 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     event SignerUpdated(address indexed newSigner);
     event ReferralSplitUpdated(uint16 newSplitBps);
     event MidasVaultUpdated(address indexed token, address indexed issuanceVault);
+    event LidoDepositQueueUpdated(address indexed vault, address indexed asset, address indexed queue);
 
     modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
     modifier whenVaultAllowed(address vault) { if (vaultWhitelistEnabled) require(allowedVaults[vault], "Vault not whitelisted"); _; }
@@ -167,6 +170,17 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     function setMidasVaultBatch(address[] calldata t, address[] calldata iv) external onlyOwner {
         require(t.length == iv.length);
         for (uint256 i = 0; i < t.length; i++) { midasVaults[t[i]] = iv[i]; emit MidasVaultUpdated(t[i], iv[i]); }
+    }
+    function setLidoDepositQueue(address vault, address asset, address queue) external onlyOwner {
+        lidoDepositQueues[vault][asset] = queue;
+        emit LidoDepositQueueUpdated(vault, asset, queue);
+    }
+    function setLidoDepositQueueBatch(address[] calldata vaults, address[] calldata assets, address[] calldata queues) external onlyOwner {
+        require(vaults.length == assets.length && assets.length == queues.length);
+        for (uint256 i = 0; i < vaults.length; i++) {
+            lidoDepositQueues[vaults[i]][assets[i]] = queues[i];
+            emit LidoDepositQueueUpdated(vaults[i], assets[i], queues[i]);
+        }
     }
     function setSigner(address _s) external onlyOwner { require(_s != address(0)); signer = _s; emit SignerUpdated(_s); }
     function setReferralSplit(uint16 _bps) external onlyOwner { require(_bps <= 10000); referralSplitBps = _bps; emit ReferralSplitUpdated(_bps); }
@@ -254,6 +268,23 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
             uint256 shares = abi.decode(rd, (uint256));
             if (shares > 0) IERC20(vault).safeTransfer(recipient, shares);
             IERC20(asset).forceApprove(vault, 0);
+            return;
+        }
+        // Lido Earn: deposits go through SyncDepositQueue which mints share tokens to msg.sender
+        // when the on-chain price report is fresh (max 32h age). Router pulls the resulting
+        // share tokens out of its own balance and forwards them to the user.
+        address lidoQueue = lidoDepositQueues[vault][asset];
+        if (lidoQueue != address(0)) {
+            IERC20(asset).forceApprove(lidoQueue, amt);
+            uint256 balBefore = IERC20(vault).balanceOf(address(this));
+            bytes32[] memory emptyProof = new bytes32[](0);
+            (bool ok, bytes memory rd) = lidoQueue.call(
+                abi.encodeWithSignature("deposit(uint224,address,bytes32[])", uint224(amt), recipient, emptyProof)
+            );
+            IERC20(asset).forceApprove(lidoQueue, 0);
+            if (!ok) _revertWithReason(rd, "Lido deposit failed");
+            uint256 received = IERC20(vault).balanceOf(address(this)) - balBefore;
+            if (received > 0) IERC20(vault).safeTransfer(recipient, received);
             return;
         }
         // ERC-4626 or Custom (syncDeposit)
