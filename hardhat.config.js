@@ -45,6 +45,16 @@ module.exports = {
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
       chainId: 143,
     },
+    hyperliquid: {
+      url: process.env.HYPERLIQUID_RPC_URL || "https://rpc.hyperliquid.xyz/evm",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      chainId: 999,
+    },
+    katana: {
+      url: process.env.KATANA_RPC_URL || "https://rpc.katanarpc.com",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      chainId: 747474,
+    },
   },
   etherscan: {
     apiKey: process.env.ETHERSCAN_API_KEY || "",
@@ -63,6 +73,22 @@ module.exports = {
         urls: {
           apiURL: "https://api.monadscan.com/api",
           browserURL: "https://monadscan.com"
+        }
+      },
+      {
+        network: "hyperliquid",
+        chainId: 999,
+        urls: {
+          apiURL: "https://api.hyperevmscan.io/api",
+          browserURL: "https://hyperevmscan.io"
+        }
+      },
+      {
+        network: "katana",
+        chainId: 747474,
+        urls: {
+          apiURL: "https://api.katanascan.com/api",
+          browserURL: "https://katanascan.com"
         }
       }
     ]
