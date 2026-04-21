@@ -63,6 +63,11 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
 
+    function initializeV3(address _owner) external initializer {
+        __Pausable_init();
+        owner = _owner;
+    }
+
     function reinitializeV5() external reinitializer(5) {}
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
