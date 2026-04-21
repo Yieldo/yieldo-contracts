@@ -1,108 +1,61 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
-import "./interfaces/IPriceOracle.sol";
+import "./interfaces/IVaultAdapter.sol";
 
-contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
+contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "2.6.2";
-    bytes32 private constant DEPOSIT_INTENT_TYPEHASH = keccak256(
-        "DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline,uint256 feeBps)"
-    );
+    string public constant VERSION = "3.0.0";
 
-    struct DepositIntent {
-        address user;
-        address vault;
-        address asset;
-        uint256 amount;
-        uint256 nonce;
-        uint256 deadline;
-        uint256 feeBps;
-    }
-
-    struct DepositRecord {
-        address user;
-        address vault;
-        address asset;
-        uint256 amount;
-        uint256 deadline;
-        uint256 timestamp;
-        bool executed;
-        bool cancelled;
-        uint256 feeBps;
-    }
-
-    // Retained struct: referenced by the dormant storage slot below to preserve UUPS layout.
-    struct WithdrawRequest {
-        address user;
-        address vault;
-        address asset;
-        address escrow;
-        uint256 shares;
-        uint256 protocolRequestId;
-        bool claimed;
-    }
-
-    // V1 storage (slots 0-8, DO NOT reorder)
-    mapping(address => uint256) public nonces;
-    mapping(bytes32 => DepositRecord) public deposits;
-    mapping(address => mapping(address => uint256)) public referralEarnings;
-    address public FEE_COLLECTOR;
+    // V1 storage — slots preserved for UUPS layout compatibility (DO NOT reorder or remove)
+    mapping(address => uint256) private _deprecated_nonces;
+    mapping(bytes32 => bytes32) private _deprecated_deposits; // was DepositRecord mapping
+    mapping(address => mapping(address => uint256)) private _deprecated_referralEarnings;
+    address private _deprecated_feeCollector;
     address public owner;
-    IPriceOracle public oracle;
-    mapping(address => bytes32) public priceFeedIds; // deprecated, kept for layout
-    uint256 public maxSlippageBps;
-    uint256 public minDepositUsd;
-    // V2+ storage
-    uint256 public feeBps;
+    address private _deprecated_oracle;
+    mapping(address => bytes32) private _deprecated_priceFeedIds;
+    uint256 private _deprecated_maxSlippageBps;
+    uint256 private _deprecated_minDepositUsd;
+    // V2 storage — deprecated slots
+    uint256 private _deprecated_feeBps;
     mapping(address => bool) public allowedVaults;
     bool public vaultWhitelistEnabled;
     address public pendingOwner;
     mapping(address => address) public vedaTellers;
-    address public signer;
+    address private _deprecated_signer;
     mapping(address => address) public midasVaults;
-    uint16 public referralSplitBps; // V2.5.2: admin-configurable referrer share of fee (0-10000)
-    // V2.6 storage (deprecated in V2.6.1 — withdrawals now go direct-to-protocol; slots preserved for UUPS compat)
+    uint16 private _deprecated_referralSplitBps;
+    // V2.6 storage — deprecated
     mapping(address => address) private _deprecated_midasRedemptionVaults;
-    mapping(bytes32 => WithdrawRequest) private _deprecated_withdrawRequests;
+    mapping(bytes32 => bytes32) private _deprecated_withdrawRequests; // was WithdrawRequest mapping
     address private _deprecated_withdrawEscrowImpl;
-    // V2.6.2: Lido Earn — shareVault => asset => SyncDepositQueue.
+    // V2.6.2
     mapping(address => mapping(address => address)) public lidoDepositQueues;
-    uint256[37] private __gap;
+    // V2.7
+    mapping(address => address) public vaultAdapters;
+    uint256[36] private __gap;
 
-    event DepositIntentCreated(bytes32 indexed intentHash, address indexed user, address indexed vault, address asset, uint256 amount, uint256 nonce, uint256 deadline);
-    event DepositExecuted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount, uint256 usdValue);
-    event DepositIntentCancelled(bytes32 indexed intentHash, address indexed user);
-    event FeeCollected(bytes32 indexed intentHash, address indexed asset, uint256 feeAmount);
-    event DepositRequestSubmitted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount, uint256 requestId);
-    event CrossChainDepositExecuted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount, address executor, uint256 usdValue);
-    event ReferralFeeCollected(bytes32 indexed intentHash, address indexed referrer, address indexed asset, uint256 feeAmount);
+    event Routed(bytes32 indexed partnerId, uint8 partnerType, address indexed user, address indexed vault, address asset, uint256 amount);
+    event DepositRequestRouted(bytes32 indexed partnerId, uint8 partnerType, address indexed user, address indexed vault, address asset, uint256 amount, uint256 requestId);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    event OracleUpdated(address indexed newOracle);
-    event FeeCollectorUpdated(address indexed newFeeCollector);
-    event FeeBpsUpdated(uint256 newFeeBps);
-    event MaxSlippageUpdated(uint256 newSlippageBps);
-    event MinDepositUsdUpdated(uint256 newMinDepositUsd);
     event VaultWhitelistToggled(bool enabled);
     event VaultAllowlistUpdated(address indexed vault, bool allowed);
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
     event VedaTellerUpdated(address indexed vault, address indexed teller);
-    event SignerUpdated(address indexed newSigner);
-    event ReferralSplitUpdated(uint16 newSplitBps);
     event MidasVaultUpdated(address indexed token, address indexed issuanceVault);
     event LidoDepositQueueUpdated(address indexed vault, address indexed asset, address indexed queue);
+    event VaultAdapterUpdated(address indexed vault, address indexed adapter);
 
     modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
     modifier whenVaultAllowed(address vault) { if (vaultWhitelistEnabled) require(allowedVaults[vault], "Vault not whitelisted"); _; }
@@ -110,37 +63,12 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
 
-    function initialize(address _feeCollector, address _oracle) external initializer {
-        require(_feeCollector != address(0) && _oracle != address(0));
-        __EIP712_init("DepositRouter", "1");
-        __Pausable_init();
-        FEE_COLLECTOR = _feeCollector;
-        oracle = IPriceOracle(_oracle);
-        owner = msg.sender;
-        maxSlippageBps = 200;
-        minDepositUsd = 10e18;
-        feeBps = 10;
-    }
-
-    function reinitialize(address _oracle, uint256 _feeBps) external reinitializer(2) {
-        __Pausable_init();
-        require(_oracle != address(0) && _feeBps <= 1000);
-        oracle = IPriceOracle(_oracle);
-        feeBps = _feeBps;
-    }
-
-    function reinitializeV3(address _signer) external reinitializer(3) {
-        require(_signer != address(0));
-        signer = _signer;
-    }
-
-    function reinitializeV4() external reinitializer(4) {
-        referralSplitBps = 5000; // default 50/50
-    }
+    function reinitializeV5() external reinitializer(5) {}
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
-    // Admin: ownership
+    // ── Admin: ownership ──
+
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0));
         pendingOwner = newOwner;
@@ -153,12 +81,8 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         pendingOwner = address(0);
     }
 
-    // Admin: configuration
-    function setOracle(address _oracle) external onlyOwner { oracle = IPriceOracle(_oracle); emit OracleUpdated(_oracle); }
-    function setFeeCollector(address _fc) external onlyOwner { require(_fc != address(0)); FEE_COLLECTOR = _fc; emit FeeCollectorUpdated(_fc); }
-    function setFeeBps(uint256 _feeBps) external onlyOwner { require(_feeBps <= 1000); feeBps = _feeBps; emit FeeBpsUpdated(_feeBps); }
-    function setMaxSlippage(uint256 _bps) external onlyOwner { require(_bps <= 1000); maxSlippageBps = _bps; emit MaxSlippageUpdated(_bps); }
-    function setMinDepositUsd(uint256 _min) external onlyOwner { minDepositUsd = _min; emit MinDepositUsdUpdated(_min); }
+    // ── Admin: configuration ──
+
     function setVaultWhitelistEnabled(bool _e) external onlyOwner { vaultWhitelistEnabled = _e; emit VaultWhitelistToggled(_e); }
     function setVaultAllowed(address v, bool a) external onlyOwner { allowedVaults[v] = a; emit VaultAllowlistUpdated(v, a); }
     function setVaultAllowedBatch(address[] calldata v, bool[] calldata a) external onlyOwner {
@@ -182,8 +106,11 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
             emit LidoDepositQueueUpdated(vaults[i], assets[i], queues[i]);
         }
     }
-    function setSigner(address _s) external onlyOwner { require(_s != address(0)); signer = _s; emit SignerUpdated(_s); }
-    function setReferralSplit(uint16 _bps) external onlyOwner { require(_bps <= 10000); referralSplitBps = _bps; emit ReferralSplitUpdated(_bps); }
+    function setVaultAdapter(address vault, address adapter) external onlyOwner { vaultAdapters[vault] = adapter; emit VaultAdapterUpdated(vault, adapter); }
+    function setVaultAdapterBatch(address[] calldata vaults, address[] calldata adapters) external onlyOwner {
+        require(vaults.length == adapters.length);
+        for (uint256 i = 0; i < vaults.length; i++) { vaultAdapters[vaults[i]] = adapters[i]; emit VaultAdapterUpdated(vaults[i], adapters[i]); }
+    }
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
     function withdrawETH() external onlyOwner {
@@ -198,54 +125,38 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         emit TokensRescued(token, to, amt);
     }
 
-    // Internal helpers
-    function _getRecordFeeBps(uint256 r) internal view returns (uint256) { return r > 0 ? r : feeBps; }
+    // ── Public: deposit (same-chain + two-step cross-chain step-2) ──
 
-    function _getUsdValue(address asset, uint256 amount) internal view returns (uint256) {
-        if (address(oracle) == address(0) || !oracle.hasFeed(asset)) return 0;
-        return oracle.getUsdValue(asset, amount);
+    function depositFor(
+        address vault, address asset, uint256 amount, address user,
+        bytes32 partnerId, uint8 partnerType, bool isERC4626
+    ) external nonReentrant whenNotPaused whenVaultAllowed(vault) {
+        require(user != address(0) && vault != address(0) && amount > 0);
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+        _executeVaultCall(vault, asset, amount, user, isERC4626);
+        emit Routed(partnerId, partnerType, user, vault, asset, amount);
     }
 
-    function _collectFee(bytes32 ih, address asset, uint256 fee, address user, address referrer) internal {
-        if (fee == 0) return;
-        if (referrer != address(0) && referrer != user) {
-            uint256 split = referralSplitBps;
-            if (split == 0) split = 5000; // safety default for pre-V4 proxies; reinitializeV4 sets this to 5000
-            uint256 rFee = (fee * split) / 10000;
-            if (rFee > 0) {
-                IERC20(asset).safeTransfer(referrer, rFee);
-                referralEarnings[referrer][asset] += rFee;
-                emit ReferralFeeCollected(ih, referrer, asset, rFee);
-            }
-            if (fee - rFee > 0) IERC20(asset).safeTransfer(FEE_COLLECTOR, fee - rFee);
-        } else {
-            IERC20(asset).safeTransfer(FEE_COLLECTOR, fee);
-        }
-        emit FeeCollected(ih, asset, fee);
+    function depositRequestFor(
+        address vault, address asset, uint256 amount, address user,
+        bytes32 partnerId, uint8 partnerType
+    ) external nonReentrant whenNotPaused whenVaultAllowed(vault) {
+        require(user != address(0) && vault != address(0) && amount > 0);
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 rid = _executeVaultRequestCall(vault, asset, amount, user);
+        emit DepositRequestRouted(partnerId, partnerType, user, vault, asset, amount, rid);
     }
 
-    function _validateIntent(DepositIntent calldata i, bytes calldata sig) internal view {
-        require(i.user != address(0) && i.vault != address(0) && i.asset != address(0));
-        require(i.amount > 0 && i.feeBps <= 1000);
-        require(verifyIntent(i, sig), "Invalid signature");
-        require(block.timestamp <= i.deadline, "Intent expired");
-        require(i.nonce == nonces[i.user], "Invalid nonce");
-    }
-
-    function _computeIntentHash(DepositIntent calldata i) internal pure returns (bytes32) {
-        return keccak256(abi.encode(DEPOSIT_INTENT_TYPEHASH, i.user, i.vault, i.asset, i.amount, i.nonce, i.deadline, i.feeBps));
-    }
-
-    function _createRecord(bytes32 ih, DepositIntent calldata i, bool executed) internal {
-        require(deposits[ih].user == address(0), "Intent exists");
-        nonces[i.user]++;
-        deposits[ih] = DepositRecord(i.user, i.vault, i.asset, i.amount, i.deadline, block.timestamp, executed, false, i.feeBps);
-        emit DepositIntentCreated(ih, i.user, i.vault, i.asset, i.amount, i.nonce, i.deadline);
-    }
+    // ── Internal: vault dispatch (UNCHANGED from V2.7) ──
 
     function _executeVaultCall(address vault, address asset, uint256 amt, address recipient, bool isERC4626) internal {
-        // Midas: deposits go through separate issuance vault.
-        // Midas depositInstant expects amountToken in base18, not token-native decimals.
+        address adapter = vaultAdapters[vault];
+        if (adapter != address(0)) {
+            IERC20(asset).safeTransfer(adapter, amt);
+            uint256 shares = IVaultAdapter(adapter).deposit(vault, asset, amt, recipient);
+            require(shares > 0, "Adapter returned 0 shares");
+            return;
+        }
         address midasIV = midasVaults[vault];
         if (midasIV != address(0)) {
             IERC20(asset).forceApprove(midasIV, amt);
@@ -259,7 +170,6 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
             IERC20(asset).forceApprove(midasIV, 0);
             return;
         }
-        // Veda BoringVault: deposits go through teller
         address teller = vedaTellers[vault];
         if (teller != address(0)) {
             IERC20(asset).forceApprove(vault, amt);
@@ -270,11 +180,6 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
             IERC20(asset).forceApprove(vault, 0);
             return;
         }
-        // Lido Earn: deposits go through SyncDepositQueue, which mints share tokens
-        // to msg.sender when the on-chain price report is fresh. If the report is
-        // stale the queue silently queues the deposit asynchronously — we guard
-        // with a require on non-zero share delta so that stale-report paths revert
-        // and return the user's assets rather than stranding them in the queue.
         address lidoQueue = lidoDepositQueues[vault][asset];
         if (lidoQueue != address(0)) {
             require(amt <= type(uint224).max, "Lido amt overflow");
@@ -291,7 +196,6 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
             IERC20(vault).safeTransfer(recipient, received);
             return;
         }
-        // ERC-4626 or Custom (syncDeposit)
         IERC20(asset).forceApprove(vault, amt);
         {
             bool ok; bytes memory rd;
@@ -327,150 +231,8 @@ contract DepositRouter is Initializable, EIP712Upgradeable, ReentrancyGuard, Pau
         revert(fb);
     }
 
-    function _validateSlippageAndMinDeposit(address asset, uint256 expected, uint256 actual) internal view {
-        if (address(oracle) != address(0) && oracle.hasFeed(asset)) {
-            uint256 expUsd = oracle.getUsdValue(asset, expected);
-            uint256 actUsd = oracle.getUsdValue(asset, actual);
-            if (expUsd > 0) require(actUsd >= (expUsd * (10000 - maxSlippageBps)) / 10000, "Slippage exceeds limit");
-            if (minDepositUsd > 0) require(actUsd >= minDepositUsd, "Below minimum deposit");
-        }
-    }
+    // ── View ──
 
-    function _pullCrossChainTokens(address asset, uint256 intentAmt) internal returns (uint256) {
-        uint256 bal = IERC20(asset).balanceOf(address(this));
-        if (bal >= intentAmt) return intentAmt;
-        uint256 needed = intentAmt - bal;
-        require(IERC20(asset).allowance(msg.sender, address(this)) >= needed, "Insufficient allowance");
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), needed);
-        return intentAmt;
-    }
-
-    function _handlePriceUpdate(bytes[] calldata pu) internal {
-        if (pu.length > 0 && address(oracle) != address(0)) {
-            (bool feeOk, bytes memory fd) = address(oracle).staticcall(abi.encodeWithSignature("getUpdateFee(bytes[])", pu));
-            require(feeOk && fd.length >= 32, "Fee query failed");
-            uint256 fee = abi.decode(fd, (uint256));
-            require(address(this).balance >= fee, "Insufficient ETH for oracle");
-            (bool ok, ) = address(oracle).call{value: fee}(abi.encodeWithSignature("updatePriceFeeds(bytes[])", pu));
-            require(ok, "Price update failed");
-            if (msg.value > fee) { (bool r, ) = msg.sender.call{value: msg.value - fee}(""); require(r); }
-        }
-    }
-
-    // Public: intent creation
-    function createDepositIntent(DepositIntent calldata i, bytes calldata sig) external whenNotPaused returns (bytes32 ih) {
-        _validateIntent(i, sig);
-        ih = _computeIntentHash(i);
-        _createRecord(ih, i, false);
-    }
-
-    // Public: same-chain deposits
-    function depositWithIntent(DepositIntent calldata i, bytes calldata sig, address ref) external nonReentrant whenNotPaused whenVaultAllowed(i.vault) returns (bytes32) {
-        return _depositWithIntent(i, sig, false, ref);
-    }
-    function depositWithIntentERC4626(DepositIntent calldata i, bytes calldata sig, address ref) external nonReentrant whenNotPaused whenVaultAllowed(i.vault) returns (bytes32) {
-        return _depositWithIntent(i, sig, true, ref);
-    }
-    function _depositWithIntent(DepositIntent calldata i, bytes calldata sig, bool isERC4626, address ref) internal returns (bytes32 ih) {
-        _validateIntent(i, sig);
-        ih = _computeIntentHash(i);
-        _createRecord(ih, i, true);
-        IERC20(i.asset).safeTransferFrom(i.user, address(this), i.amount);
-        uint256 fee = (i.amount * i.feeBps) / 10000;
-        uint256 depAmt = i.amount - fee;
-        _collectFee(ih, i.asset, fee, i.user, ref);
-        _executeVaultCall(i.vault, i.asset, depAmt, i.user, isERC4626);
-        emit DepositExecuted(ih, i.user, i.vault, depAmt, _getUsdValue(i.asset, depAmt));
-    }
-
-    // Public: same-chain request deposits
-    function depositWithIntentRequest(DepositIntent calldata i, bytes calldata sig, address ref) external nonReentrant whenNotPaused whenVaultAllowed(i.vault) returns (bytes32 ih, uint256 rid) {
-        _validateIntent(i, sig);
-        ih = _computeIntentHash(i);
-        _createRecord(ih, i, true);
-        IERC20(i.asset).safeTransferFrom(i.user, address(this), i.amount);
-        uint256 fee = (i.amount * i.feeBps) / 10000;
-        uint256 depAmt = i.amount - fee;
-        _collectFee(ih, i.asset, fee, i.user, ref);
-        rid = _executeVaultRequestCall(i.vault, i.asset, depAmt, i.user);
-        emit DepositRequestSubmitted(ih, i.user, i.vault, depAmt, rid);
-    }
-
-    // Public: deferred execution
-    function executeDeposit(bytes32 ih, address ref) external nonReentrant whenNotPaused {
-        DepositRecord storage r = deposits[ih];
-        require(r.user != address(0) && !r.executed && !r.cancelled && block.timestamp <= r.deadline);
-        if (vaultWhitelistEnabled) require(allowedVaults[r.vault]);
-        r.executed = true;
-        IERC20(r.asset).safeTransferFrom(r.user, address(this), r.amount);
-        uint256 fb = _getRecordFeeBps(r.feeBps);
-        uint256 fee = (r.amount * fb) / 10000;
-        uint256 depAmt = r.amount - fee;
-        _collectFee(ih, r.asset, fee, r.user, ref);
-        _executeVaultCall(r.vault, r.asset, depAmt, r.user, false);
-        emit DepositExecuted(ih, r.user, r.vault, depAmt, _getUsdValue(r.asset, depAmt));
-    }
-
-    // Public: cancel
-    function cancelIntent(bytes32 ih) external {
-        DepositRecord storage r = deposits[ih];
-        require(r.user != address(0) && r.user == msg.sender && !r.executed && !r.cancelled);
-        r.cancelled = true;
-        emit DepositIntentCancelled(ih, msg.sender);
-    }
-
-    // Public: cross-chain deposits
-    function depositWithIntentCrossChain(DepositIntent calldata i, bytes calldata sig, address ref, bytes[] calldata pu) external payable nonReentrant whenNotPaused whenVaultAllowed(i.vault) returns (bytes32) {
-        return _depositWithIntentCrossChain(i, sig, false, ref, pu);
-    }
-    function depositWithIntentCrossChainERC4626(DepositIntent calldata i, bytes calldata sig, address ref, bytes[] calldata pu) external payable nonReentrant whenNotPaused whenVaultAllowed(i.vault) returns (bytes32) {
-        return _depositWithIntentCrossChain(i, sig, true, ref, pu);
-    }
-    function _depositWithIntentCrossChain(DepositIntent calldata i, bytes calldata sig, bool isERC4626, address ref, bytes[] calldata pu) internal returns (bytes32 ih) {
-        _handlePriceUpdate(pu);
-        _validateIntent(i, sig);
-        ih = _computeIntentHash(i);
-        _createRecord(ih, i, true);
-        uint256 actual = _pullCrossChainTokens(i.asset, i.amount);
-        _validateSlippageAndMinDeposit(i.asset, i.amount, actual);
-        uint256 fee = (actual * i.feeBps) / 10000;
-        uint256 depAmt = actual - fee;
-        _collectFee(ih, i.asset, fee, i.user, ref);
-        _executeVaultCall(i.vault, i.asset, depAmt, i.user, isERC4626);
-        emit DepositExecuted(ih, i.user, i.vault, depAmt, _getUsdValue(i.asset, depAmt));
-        emit CrossChainDepositExecuted(ih, i.user, i.vault, depAmt, msg.sender, _getUsdValue(i.asset, depAmt));
-    }
-
-    // Public: cross-chain request deposits
-    function depositWithIntentCrossChainRequest(DepositIntent calldata i, bytes calldata sig, address ref, bytes[] calldata pu) external payable nonReentrant whenNotPaused whenVaultAllowed(i.vault) returns (bytes32 ih, uint256 rid) {
-        _handlePriceUpdate(pu);
-        _validateIntent(i, sig);
-        ih = _computeIntentHash(i);
-        _createRecord(ih, i, true);
-        uint256 actual = _pullCrossChainTokens(i.asset, i.amount);
-        _validateSlippageAndMinDeposit(i.asset, i.amount, actual);
-        uint256 fee = (actual * i.feeBps) / 10000;
-        uint256 depAmt = actual - fee;
-        _collectFee(ih, i.asset, fee, i.user, ref);
-        rid = _executeVaultRequestCall(i.vault, i.asset, depAmt, i.user);
-        emit DepositRequestSubmitted(ih, i.user, i.vault, depAmt, rid);
-        emit CrossChainDepositExecuted(ih, i.user, i.vault, depAmt, msg.sender, _getUsdValue(i.asset, depAmt));
-    }
-
-    // View functions
-    function verifyIntent(DepositIntent calldata i, bytes calldata sig) public view returns (bool) {
-        bytes32 h = _hashTypedDataV4(keccak256(abi.encode(DEPOSIT_INTENT_TYPEHASH, i.user, i.vault, i.asset, i.amount, i.nonce, i.deadline, i.feeBps)));
-        return ECDSA.recover(h, sig) == signer;
-    }
-    function getNonce(address user) external view returns (uint256) { return nonces[user]; }
-    function getDeposit(bytes32 ih) external view returns (DepositRecord memory) { return deposits[ih]; }
-    function isIntentValid(bytes32 ih) external view returns (bool) {
-        DepositRecord storage r = deposits[ih];
-        return r.user != address(0) && !r.executed && !r.cancelled && block.timestamp <= r.deadline;
-    }
-    function getUsdValue(address asset, uint256 amount) external view returns (uint256) { return _getUsdValue(asset, amount); }
-    function getReferralEarnings(address ref, address asset) external view returns (uint256) { return referralEarnings[ref][asset]; }
-    function domainSeparator() external view returns (bytes32) { return _domainSeparatorV4(); }
     function getImplementation() external view returns (address) { return ERC1967Utils.getImplementation(); }
 
     receive() external payable {}
