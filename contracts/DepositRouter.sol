@@ -14,7 +14,7 @@ import "./interfaces/IVaultAdapter.sol";
 contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "3.1.0";
+    string public constant VERSION = "3.1.1";
 
     // Storage layout — DO NOT reorder or remove; UUPS upgrade compatibility.
     mapping(address => uint256) private _deprecated_nonces;
@@ -187,7 +187,10 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
 
     // Assets are pulled from msg.sender, NOT from `user`. A user's approval to this router
     // is never spent when a different address calls with them as `user`. Attribution to any
-    // `user` is intentional (wallet-SDK model), gated by `authorizedCallers`.
+    // `user` is intentional (wallet-SDK model) — in V3.1.1 the caller check is open so any
+    // LiFi bridge receiver can land composer deposits without needing a whitelist update.
+    // `authorizedCallers` storage is kept for potential future re-enablement; `setAuthorizedCaller*`
+    // and the mapping remain functional but are not consulted here.
     function depositFor(
         address vault,
         address asset,
@@ -199,7 +202,6 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
         uint256 minSharesOut
     ) public nonReentrant whenNotPaused whenVaultAllowed(vault) {
         require(user != address(0) && vault != address(0) && asset != address(0) && amount > 0, "Bad params");
-        require(msg.sender == user || authorizedCallers[msg.sender], "Unauthorized caller");
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         uint256 shares = _executeVaultCall(vault, asset, amount, user, isERC4626);
         require(shares >= minSharesOut, "Slippage");
@@ -229,7 +231,6 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
         uint8 partnerType
     ) external nonReentrant whenNotPaused whenVaultAllowed(vault) {
         require(user != address(0) && vault != address(0) && asset != address(0) && amount > 0, "Bad params");
-        require(msg.sender == user || authorizedCallers[msg.sender], "Unauthorized caller");
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         uint256 rid = _executeVaultRequestCall(vault, asset, amount, user);
         emit DepositRequestRouted(partnerId, partnerType, user, vault, asset, amount, rid);
