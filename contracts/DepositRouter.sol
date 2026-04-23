@@ -14,7 +14,7 @@ import "./interfaces/IVaultAdapter.sol";
 contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    string public constant VERSION = "3.1.1";
+    string public constant VERSION = "3.2.0";
 
     // Storage layout — DO NOT reorder or remove; UUPS upgrade compatibility.
     mapping(address => uint256) private _deprecated_nonces;
@@ -222,6 +222,31 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
         depositFor(vault, asset, amount, user, partnerId, partnerType, isERC4626, 0);
     }
 
+    // V3.2.0 — pulls min(allowance, balance) from msg.sender. Designed for cross-chain
+    // composer flows where the caller (e.g. LiFi Executor) holds the post-bridge balance
+    // and approves the router for that exact amount before invoking us. Eliminates the
+    // calldata `amount` mismatch that bridge-fee underflows would otherwise cause.
+    function depositForAvailable(
+        address vault,
+        address asset,
+        address user,
+        bytes32 partnerId,
+        uint8 partnerType,
+        bool isERC4626,
+        uint256 minAmount,
+        uint256 minSharesOut
+    ) external nonReentrant whenNotPaused whenVaultAllowed(vault) {
+        require(user != address(0) && vault != address(0) && asset != address(0), "Bad params");
+        uint256 allowed = IERC20(asset).allowance(msg.sender, address(this));
+        uint256 bal = IERC20(asset).balanceOf(msg.sender);
+        uint256 amount = allowed < bal ? allowed : bal;
+        require(amount >= minAmount && amount > 0, "Insufficient");
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 shares = _executeVaultCall(vault, asset, amount, user, isERC4626);
+        require(shares >= minSharesOut, "Slippage");
+        emit Routed(partnerId, partnerType, user, vault, asset, amount, shares);
+    }
+
     function depositRequestFor(
         address vault,
         address asset,
@@ -314,12 +339,18 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
 
         IERC20(asset).forceApprove(vault, amt);
         if (isERC4626) {
+            uint256 recipBefore4626 = IERC20(vault).balanceOf(recipient);
             (bool vok, bytes memory vrd) = vault.call(
                 abi.encodeWithSignature("deposit(uint256,address)", amt, recipient)
             );
             if (!vok) _revertWithReason(vrd, "ERC4626 deposit failed");
-            require(vrd.length >= 32, "ERC4626: bad return");
-            shares = abi.decode(vrd, (uint256));
+            // Most ERC-4626 vaults return shares; some non-standard ones return void.
+            // Fall back to balanceOf delta when return data is missing.
+            if (vrd.length >= 32) {
+                shares = abi.decode(vrd, (uint256));
+            } else {
+                shares = IERC20(vault).balanceOf(recipient) - recipBefore4626;
+            }
         } else {
             uint256 recipBefore = IERC20(vault).balanceOf(recipient);
             (bool vok, bytes memory vrd) = vault.call(
