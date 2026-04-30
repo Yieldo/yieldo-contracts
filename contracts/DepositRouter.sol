@@ -45,7 +45,11 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
     mapping(address => bool) public authorizedCallers;
     address public lidoReferrer;
     bool public authChecksEnabled;
-    uint256[33] private __gap;
+    // Per-vault count of non-zero lidoDepositQueues entries. Lets the M-01 mutex
+    // check "is any lido route set for V?" without enumerating assets. Pre-upgrade
+    // proxies must call seedLidoRouteCount() once to sync this with existing state.
+    mapping(address => uint256) public lidoRouteCount;
+    uint256[32] private __gap;
 
     event Routed(
         bytes32 indexed partnerId,
@@ -127,12 +131,40 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
         pendingOwner = address(0);
     }
 
-    // self: 1=adapter, 2=midas, 3=veda. lidoDepositQueues is keyed by (vault,asset)
-    // and excluded from this mutex.
+    // self: 1=adapter, 2=midas, 3=veda, 4=lido.
     function _requireNoOtherRoute(address vault, uint8 self) internal view {
         if (self != 1) require(vaultAdapters[vault] == address(0), "M01: adapter set");
         if (self != 2) require(midasVaults[vault] == address(0), "M01: midas set");
         if (self != 3) require(vedaTellers[vault] == address(0), "M01: veda set");
+        if (self != 4) require(lidoRouteCount[vault] == 0, "M01: lido set");
+    }
+
+    // Internal helper: maintains lidoRouteCount and enforces M-01 mutex for lido sets.
+    function _writeLidoQueue(address vault, address asset, address queue) internal {
+        address current = lidoDepositQueues[vault][asset];
+        if (current == queue) return;
+        if (queue != address(0) && current == address(0)) {
+            _requireNoOtherRoute(vault, 4);
+            lidoRouteCount[vault] += 1;
+        } else if (queue == address(0) && current != address(0)) {
+            lidoRouteCount[vault] -= 1;
+        }
+        lidoDepositQueues[vault][asset] = queue;
+        emit LidoDepositQueueUpdated(vault, asset, queue);
+    }
+
+    // One-shot owner sync for the deployed proxy: lidoRouteCount was added in
+    // V3.3.0 and starts at 0 even for vaults that already had lido queues set on
+    // V3.2.x. Call this with all (vault, asset) pairs that currently have a
+    // non-zero lidoDepositQueues entry to make the counter reflect reality.
+    // Idempotent: counts each (vault, asset) at most once.
+    function seedLidoRouteCount(address[] calldata vaults, address[] calldata assets) external onlyOwner {
+        require(vaults.length == assets.length, "Length mismatch");
+        for (uint256 i = 0; i < vaults.length; i++) {
+            if (lidoDepositQueues[vaults[i]][assets[i]] != address(0)) {
+                lidoRouteCount[vaults[i]] += 1;
+            }
+        }
     }
 
     function setVaultWhitelistEnabled(bool _e) external onlyOwner {
@@ -181,9 +213,7 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
     }
 
     function setLidoDepositQueue(address vault, address asset, address queue) external onlyOwner {
-        if (lidoDepositQueues[vault][asset] == queue) return;
-        lidoDepositQueues[vault][asset] = queue;
-        emit LidoDepositQueueUpdated(vault, asset, queue);
+        _writeLidoQueue(vault, asset, queue);
     }
 
     function setLidoDepositQueueBatch(
@@ -191,9 +221,7 @@ contract DepositRouter is Initializable, ReentrancyGuard, PausableUpgradeable, U
     ) external onlyOwner {
         require(vaults.length == assets.length && assets.length == queues.length, "Length mismatch");
         for (uint256 i = 0; i < vaults.length; i++) {
-            if (lidoDepositQueues[vaults[i]][assets[i]] == queues[i]) continue;
-            lidoDepositQueues[vaults[i]][assets[i]] = queues[i];
-            emit LidoDepositQueueUpdated(vaults[i], assets[i], queues[i]);
+            _writeLidoQueue(vaults[i], assets[i], queues[i]);
         }
     }
 
