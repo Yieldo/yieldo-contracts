@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "chainId": "1",
+  "createdAt": 1777621684743,
+  "meta": {
+    "name": "Yieldo V3.3.0 acceptOwnership (mainnet)",
+    "description": "Claim router proxy ownership from deployer EOA. Final step of audit-fix upgrade. After execution, owner=0x25DDB6a1a32986E097dCEF257d9006d9583d6232.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x25DDB6a1a32986E097dCEF257d9006d9583d6232",
+    "createdFromOwnerAddress": "",
+    "checksum": ""
+  },
+  "transactions": [
+    {
+      "to": "0x85f76c1685046Ea226E1148EE1ab81a8a15C385d",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": {}
+    }
+  ]
+}
