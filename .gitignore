@@ -17,3 +17,14 @@ typechain-types/
 
 # Test scripts
 scripts/test-*
+
+# Internal one-shot deploy / ops scripts (kept locally, not pushed)
+scripts/deploy-v3-3-0.js
+scripts/transfer-ownership-only.js
+scripts/diagnose-init.js
+scripts/check-state.js
+scripts/check-base.js
+scripts/check-safe.js
+scripts/check-katana-safe.js
+scripts/generate-safe-tx.js
+safe-txs/
