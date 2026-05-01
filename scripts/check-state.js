@@ -6,6 +6,7 @@ const PROXIES = {
   optimism:    "0x7554937Aa95195D744A6c45E0fd7D4F95A2F8F72",
   monad:       "0xCD8dfD627A3712C9a2B079398e0d524970D5E73F",
   hyperliquid: "0xa682CD1c2Fd7c8545b401824096A600C2bD98F69",
+  katana:      "0xa682CD1c2Fd7c8545b401824096A600C2bD98F69",
 };
 async function main() {
   const proxy = PROXIES[hre.network.name];
